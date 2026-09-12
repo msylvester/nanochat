@@ -75,9 +75,9 @@ if [ -d "$BASE_CKPT_DIR" ]; then
 fi
 # d24 model (slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 (default) to 8)
 # --save-every=500 (~9 min between checkpoints) so a crash only loses recent progress, not the whole run
-torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=16 --run=$WANDB_RUN --save-every=500 $RESUME_ARGS
+torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=8 --run=$WANDB_RUN --save-every=500 $RESUME_ARGS
 # evaluate the model: CORE metric, BPB on train/val, and draw samples
-torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16
+torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=8
 
 # -----------------------------------------------------------------------------
 # SFT (teach the model conversation special tokens, tool use, multiple choice)
