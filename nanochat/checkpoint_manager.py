@@ -38,7 +38,16 @@ def _patch_missing_keys(model_data, model_config):
         model_data["x0_lambdas"] = torch.zeros(n_layer)
         log0(f"Patching missing x0_lambdas in model data to 0.0")
 
-def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
+def _prune_old_checkpoints(checkpoint_dir, pattern, keep_last=2):
+    """Delete all but the `keep_last` highest-step files matching pattern (e.g. 'model_*.pt')."""
+    import glob
+    files = glob.glob(os.path.join(checkpoint_dir, pattern))
+    steps = sorted({int(re.search(r"(\d{6})", os.path.basename(f)).group(1)) for f in files}, reverse=True)
+    for step in steps[keep_last:]:
+        for f in glob.glob(os.path.join(checkpoint_dir, pattern.replace("*", f"{step:06d}*"))):
+            os.remove(f)
+
+def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0, keep_last=2):
     if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
         # Save the model state parameters
@@ -50,12 +59,16 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta_data, f, indent=2)
         logger.info(f"Saved metadata to: {meta_path}")
+        # ponytail: disk is finite (esp. on vast.ai volumes); keep only the last N to resume from
+        _prune_old_checkpoints(checkpoint_dir, "model_*.pt", keep_last)
+        _prune_old_checkpoints(checkpoint_dir, "meta_*.json", keep_last)
     # Note that optimizer state is sharded across ranks, so each rank must save its own.
     if optimizer_data is not None:
         os.makedirs(checkpoint_dir, exist_ok=True)
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
         torch.save(optimizer_data, optimizer_path)
         logger.info(f"Saved optimizer state to: {optimizer_path}")
+        _prune_old_checkpoints(checkpoint_dir, f"optim_*_rank{rank:d}.pt", keep_last)
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     # Load the model state
