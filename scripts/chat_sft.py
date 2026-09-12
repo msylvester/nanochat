@@ -18,7 +18,7 @@ import wandb
 import torch
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
+from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, load_model, load_optimizer_state
 from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
 from nanochat.flash_attention import HAS_FA3
@@ -41,6 +41,8 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
 parser.add_argument("--load-optimizer", type=int, default=1, help="warm-start optimizer from pretrained checkpoint (0=no, 1=yes)")
+parser.add_argument("--resume-from-step", type=int, default=-1, help="resume SFT from this step (-1 = disable)")
+parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Training horizon
 parser.add_argument("--num-iterations", type=int, default=-1, help="number of optimization steps (-1 = full epoch)")
 # Batch sizes (default: inherit from pretrained checkpoint)
@@ -84,7 +86,8 @@ else:
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
+wandb_project = os.environ.get("WANDB_PROJECT", "nanochat-sft")
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project=wandb_project, name=args.run, config=user_config)
 
 # Flash Attention status
 if not HAS_FA3:
@@ -92,6 +95,24 @@ if not HAS_FA3:
 
 # Load the model and tokenizer
 model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
+base_dir = get_base_dir()
+depth = model.config.n_layer
+
+# Resume SFT from a previous SFT checkpoint if requested (overwrites the base-model weights
+# just loaded above). Note: the SFT dataloader has no resumable state, so training restarts
+# from the beginning of the epoch on resume — a few already-seen examples get reprocessed, but
+# no trained weights/optimizer momentum are lost.
+# ponytail: SFT resume restarts the epoch instead of exact cursor resume — add TaskMixture state-dict support if SFT runs get long/expensive enough for reprocessed batches to matter
+resuming = args.resume_from_step != -1
+output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d24
+sft_checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
+resume_optimizer_data = None
+resume_meta = None
+if resuming:
+    print0(f"Resuming SFT from step {args.resume_from_step}")
+    resume_model_data, resume_optimizer_data, resume_meta = load_checkpoint(sft_checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+    model.load_state_dict(resume_model_data, strict=True, assign=True)
+    del resume_model_data
 
 # Inherit training hyperparameters from pretrained checkpoint (None = inherit, explicit value = override)
 pretrain_user_config = meta.get("user_config", {})
@@ -116,7 +137,6 @@ for name, fallback, source in [
 
 orig_model = model
 model = torch.compile(model, dynamic=False)
-depth = model.config.n_layer
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
@@ -131,12 +151,16 @@ token_bytes = get_token_bytes(device=device)
 # Note that pretraining ramps weight_decay to zero by end of pretraining, so SFT continues with zero
 optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=0.0)
 
-# Optionally warm-start optimizer from pretrained checkpoint (momentum buffers etc.)
-# Note: load_state_dict overwrites param_group metadata (LRs, betas, etc.) with the
-# pretrained values. Since pretraining warmdown brings LRs to ~0, we must save and
-# restore our fresh SFT LRs after loading.
-base_dir = get_base_dir()
-if args.load_optimizer:
+if resuming:
+    # Restore SFT optimizer state exactly (momentum buffers AND LRs from where we left off)
+    optimizer.load_state_dict(resume_optimizer_data)
+    del resume_optimizer_data
+    print0("Restored SFT optimizer state from resumed checkpoint")
+elif args.load_optimizer:
+    # Optionally warm-start optimizer from pretrained checkpoint (momentum buffers etc.)
+    # Note: load_state_dict overwrites param_group metadata (LRs, betas, etc.) with the
+    # pretrained values. Since pretraining warmdown brings LRs to ~0, we must save and
+    # restore our fresh SFT LRs after loading.
     optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
     if optimizer_data is not None:
         base_lrs = [group["lr"] for group in optimizer.param_groups]
@@ -153,10 +177,12 @@ scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
 if scaler is not None:
     print0("GradScaler enabled for fp16 training")
 
-# Override the initial learning rate as a fraction of the base learning rate
-for group in optimizer.param_groups:
-    group["lr"] = group["lr"] * args.init_lr_frac
-    group["initial_lr"] = group["lr"]
+if not resuming:
+    # Override the initial learning rate as a fraction of the base learning rate.
+    # On resume, initial_lr/lr are already correctly set from the restored optimizer state.
+    for group in optimizer.param_groups:
+        group["lr"] = group["lr"] * args.init_lr_frac
+        group["initial_lr"] = group["lr"]
 
 # SFT data mixture and DataLoader
 train_tasks = [
@@ -326,7 +352,7 @@ min_val_bpb = float("inf")
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
-step = 0
+step = 0 if not resuming else resume_meta["step"]
 while True:
     flops_so_far = num_flops_per_token * args.total_batch_size * step
 
@@ -388,12 +414,10 @@ while True:
         })
         model.train()
 
-    # save checkpoint at the end of the run (all ranks participate so each saves its optimizer shard)
-    if last_step:
-        output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
-        checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
+    # save checkpoint: at the end of the run, or every save_every steps (all ranks participate so each saves its optimizer shard)
+    if last_step or (args.save_every > 0 and step > 0 and step != args.resume_from_step and step % args.save_every == 0):
         save_checkpoint(
-            checkpoint_dir,
+            sft_checkpoint_dir,
             step,
             orig_model.state_dict(),
             optimizer.state_dict(),
